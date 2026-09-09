@@ -1,0 +1,182 @@
+name: RAX QEMU backend recovery
+
+on:
+  push:
+    branches:
+      - experiment/qemu-backend-20260909
+    paths:
+      - .github/workflows/rax-qemu-backend.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rax-qemu-backend-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install QEMU and RISC-V Linux cross tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu libc6-dev-riscv64-cross xz-utils
+
+      - name: Record environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/rax-qemu-backend/evidence
+          {
+            uname -a
+            qemu-riscv64-static --version
+            riscv64-linux-gnu-gcc --version | head -n 1
+            riscv64-linux-gnu-g++ --version | head -n 1
+            riscv64-linux-gnu-ld --version | head -n 1
+          } | tee /tmp/rax-qemu-backend/evidence/environment.txt
+          sha256sum \
+            /usr/bin/qemu-riscv64-static \
+            /usr/bin/riscv64-linux-gnu-gcc \
+            /usr/bin/riscv64-linux-gnu-g++ \
+            > /tmp/rax-qemu-backend/evidence/tool-sha256.txt
+
+      - name: Build and execute RVV smoke
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/rax-qemu-backend/rvv-smoke.S <<'EOF'
+          .section .text
+          .globl _start
+          _start:
+              li t0, 4
+              vsetvli t1, t0, e32, m1, ta, ma
+              la t2, input_a
+              vle32.v v0, (t2)
+              la t3, input_b
+              vle32.v v1, (t3)
+              vadd.vv v2, v0, v1
+              la t4, output
+              vse32.v v2, (t4)
+              lw t5, 0(t4)
+              li t6, 11
+              bne t5, t6, fail
+              lw t5, 4(t4)
+              li t6, 22
+              bne t5, t6, fail
+              lw t5, 8(t4)
+              li t6, 33
+              bne t5, t6, fail
+              lw t5, 12(t4)
+              li t6, 44
+              bne t5, t6, fail
+              li a0, 0
+              li a7, 93
+              ecall
+          fail:
+              li a0, 1
+              li a7, 93
+              ecall
+
+          .section .data
+          .align 4
+          input_a: .word 1, 2, 3, 4
+          input_b: .word 10, 20, 30, 40
+          output:  .word 0, 0, 0, 0
+          EOF
+
+          riscv64-linux-gnu-gcc \
+            -nostdlib -static -march=rv64gcv -mabi=lp64d \
+            /tmp/rax-qemu-backend/rvv-smoke.S \
+            -o /tmp/rax-qemu-backend/rvv-smoke
+          riscv64-linux-gnu-objdump -d /tmp/rax-qemu-backend/rvv-smoke \
+            > /tmp/rax-qemu-backend/evidence/rvv-smoke.objdump
+          sha256sum /tmp/rax-qemu-backend/rvv-smoke \
+            > /tmp/rax-qemu-backend/evidence/rvv-smoke.sha256
+
+          for vlen in 128 256; do
+            qemu-riscv64-static \
+              -cpu "rv64,v=true,vlen=${vlen},elen=64,vext_spec=v1.0" \
+              /tmp/rax-qemu-backend/rvv-smoke
+            printf 'VLEN=%s exit=0\n' "$vlen" | tee -a \
+              /tmp/rax-qemu-backend/evidence/smoke-results.txt
+          done
+
+          set +e
+          qemu-riscv64-static -cpu 'rv64,v=false' \
+            /tmp/rax-qemu-backend/rvv-smoke \
+            > /tmp/rax-qemu-backend/evidence/no-v.stdout \
+            2> /tmp/rax-qemu-backend/evidence/no-v.stderr
+          no_v_rc=$?
+          set -e
+          printf 'V-disabled exit=%s\n' "$no_v_rc" | tee -a \
+            /tmp/rax-qemu-backend/evidence/smoke-results.txt
+          test "$no_v_rc" -ne 0
+
+      - name: Package relocatable QEMU and cross-toolchain tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          root=/tmp/rax-qemu-backend/bundle-root
+          mkdir -p "$root"
+          cp -a --parents /usr/bin/qemu-riscv64-static "$root"
+          cp -a --parents /usr/bin/riscv64-linux-gnu-* "$root"
+          cp -a --parents /usr/lib/gcc-cross/riscv64-linux-gnu "$root"
+          cp -a --parents /usr/riscv64-linux-gnu "$root"
+          if test -d /usr/lib/riscv64-linux-gnu; then
+            cp -a --parents /usr/lib/riscv64-linux-gnu "$root"
+          fi
+          if test -d /lib/riscv64-linux-gnu; then
+            cp -a --parents /lib/riscv64-linux-gnu "$root"
+          fi
+
+          # Preserve host-side shared libraries needed by the cross tools.
+          {
+            for tool in /usr/bin/riscv64-linux-gnu-gcc* \
+                        /usr/bin/riscv64-linux-gnu-g++* \
+                        /usr/bin/riscv64-linux-gnu-ld* \
+                        /usr/bin/riscv64-linux-gnu-as; do
+              test -x "$tool" || continue
+              ldd "$tool" 2>/dev/null || true
+            done
+          } | awk '{for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' \
+            | sort -u > /tmp/rax-qemu-backend/evidence/host-libraries.txt
+          while IFS= read -r library; do
+            test -f "$library" && cp -L --parents "$library" "$root"
+          done < /tmp/rax-qemu-backend/evidence/host-libraries.txt
+
+          cp /tmp/rax-qemu-backend/rvv-smoke "$root/rvv-smoke"
+          cp -a /tmp/rax-qemu-backend/evidence "$root/evidence"
+          tar -C "$root" -I 'xz -T0 -1' -cf \
+            /tmp/rax-qemu-backend/rax-qemu-riscv64-toolchain.tar.xz .
+          sha256sum /tmp/rax-qemu-backend/rax-qemu-riscv64-toolchain.tar.xz \
+            > /tmp/rax-qemu-backend/rax-qemu-riscv64-toolchain.tar.xz.sha256
+
+      - name: Upload recovery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax-qemu-riscv64-toolchain-${{ github.run_id }}
+          path: |
+            /tmp/rax-qemu-backend/rax-qemu-riscv64-toolchain.tar.xz
+            /tmp/rax-qemu-backend/rax-qemu-riscv64-toolchain.tar.xz.sha256
+            /tmp/rax-qemu-backend/evidence
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload partial evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax-qemu-backend-failure-${{ github.run_id }}
+          path: /tmp/rax-qemu-backend
+          if-no-files-found: warn
+          retention-days: 7
